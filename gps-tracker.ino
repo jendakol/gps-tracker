@@ -3,6 +3,7 @@
 #include <SD.h>
 #include <SoftwareSerial.h>
 #include <TinyGPSPlus.h>
+#include "Led.cpp"
 
 #define GT_PIN_GPS_RX 4
 #define GT_PIN_GPS_TX 3
@@ -26,6 +27,10 @@
 TinyGPSPlus gps;
 SoftwareSerial gpsSerial(GT_PIN_GPS_RX, GT_PIN_GPS_TX);
 
+Led *redLed = new Led("RED", GT_PIN_LED_RED);
+Led *greenLed = new Led("GREEN", GT_PIN_LED_GREEN);
+Led *blueLed = new Led("BLUE", GT_PIN_LED_BLUE);
+
 File dataFile;
 char filename[25];
 
@@ -38,15 +43,9 @@ TinyGPSInteger last_sats;
 
 static void beep(int length);
 
-static void beepAndBlinkRed(int length);
-
-static void beepAndBlinkGreen(int length);
-
 static void smartDelay(unsigned long ms);
 
 void writeToGpx();
-
-void resetLEDs();
 
 bool gpsValid();
 
@@ -54,7 +53,11 @@ void snapshotGPS();
 
 void cardNotReady();
 
+void refreshLEDState();
+
 void initGPS() {
+    refreshLEDState();
+
     gpsSerial.begin(9600);
 
     gpsSerial.print(F("$PUBX,41,1,0007,0003,4800,0*13\r\n"));
@@ -72,6 +75,8 @@ void initGPS() {
 unsigned long lastPrevention = 0;
 
 void preventOverflow() {
+    refreshLEDState();
+
     if (millis() - lastPrevention > 100) {
         smartDelay(1);
         lastPrevention = millis();
@@ -93,7 +98,11 @@ void setup(void) {
     pinMode(GT_PIN_LED_GREEN, OUTPUT);
     pinMode(GT_PIN_LED_BLUE, OUTPUT);
 
-    resetLEDs();
+    redLed->setState(Off);
+    greenLed->setState(Off);
+    blueLed->setState(Off);
+
+    refreshLEDState();
 
     Serial.println(F("Initializing SD card"));
 
@@ -106,8 +115,9 @@ void setup(void) {
         if (ready) Serial.println(F("SD card is ready!")); else cardNotReady();
     }
 
-    // TODO LED blinking
-    digitalWrite(GT_PIN_LED_BLUE, LOW);
+    blueLed->setState(On);
+    redLed->setState(Off);
+    greenLed->setState(Off);
 
     Serial.println(F("Searching for location..."));
 
@@ -171,19 +181,27 @@ void setup(void) {
 
     preventOverflow();
 
-    digitalWrite(GT_PIN_LED_BLUE, HIGH);
-    digitalWrite(GT_PIN_LED_GREEN, LOW);
+    greenLed->setState(BlinkingSlow);
+    redLed->setState(Off);
+    blueLed->setState(Off);
 
     Serial.println("\n");
+    refreshLEDState();
 }
 
 
 void loop(void) {
     if (millis() > 5000 && gps.charsProcessed() < 10) {
         Serial.println(F("ERROR: not getting any GPS data!"));
+        redLed->setState(BlinkingFast);
+        greenLed->setState(Off);
+        blueLed->setState(Off);
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-noreturn"
-        while (true)beepAndBlinkRed(300);
+        while (true) {
+            refreshLEDState();
+            delay(50);
+        }
 #pragma clang diagnostic pop
     }
 
@@ -195,17 +213,18 @@ void loop(void) {
     if (valid) {
         snapshotGPS();
 
-        digitalWrite(GT_PIN_LED_GREEN, LOW);
-        digitalWrite(GT_PIN_LED_RED, HIGH);
-        digitalWrite(GT_PIN_LED_BLUE, HIGH);
+        greenLed->setState(BlinkingSlow);
+        redLed->setState(Off);
+        blueLed->setState(Off);
 
         writeToGpx();
     } else {
         // TODO check what happens
         Serial.println("\nLost location!\n");
-        digitalWrite(GT_PIN_LED_BLUE, LOW);
-        digitalWrite(GT_PIN_LED_GREEN, HIGH);
-        digitalWrite(GT_PIN_LED_RED, HIGH);
+
+        blueLed->setState(On);
+        redLed->setState(Off);
+        greenLed->setState(Off);
     }
 
     smartDelay(GPX_INTERVAL);
@@ -317,10 +336,13 @@ void writeToGpx() {
 }
 
 static void smartDelay(unsigned long ms) {
+    refreshLEDState();
     unsigned long end = millis() + ms;
     do {
         while (gpsSerial.available())
             gps.encode((char) gpsSerial.read());
+
+        refreshLEDState();
     } while (millis() < end);
 }
 
@@ -330,40 +352,26 @@ static void beep(int length) {
     if (BUZZER_ENABLED) digitalWrite(GT_PIN_BUZZER, LOW);
 }
 
-static void beepAndBlinkRed(int length) {
-    resetLEDs();
-    if (BUZZER_ENABLED) digitalWrite(GT_PIN_BUZZER, HIGH);
-    digitalWrite(GT_PIN_LED_RED, LOW);
-    smartDelay(length);
-    if (BUZZER_ENABLED) digitalWrite(GT_PIN_BUZZER, LOW);
-    digitalWrite(GT_PIN_LED_RED, HIGH);
-}
-
-static void beepAndBlinkGreen(int length) {
-    resetLEDs();
-    if (BUZZER_ENABLED) digitalWrite(GT_PIN_BUZZER, HIGH);
-    digitalWrite(GT_PIN_LED_GREEN, LOW);
-    smartDelay(length);
-    if (BUZZER_ENABLED) digitalWrite(GT_PIN_BUZZER, LOW);
-    digitalWrite(GT_PIN_LED_GREEN, HIGH);
-    smartDelay(10);
-}
-
-void resetLEDs() {
-    digitalWrite(GT_PIN_LED_RED, HIGH);
-    digitalWrite(GT_PIN_LED_GREEN, HIGH);
-    digitalWrite(GT_PIN_LED_BLUE, HIGH);
-}
-
 void cardNotReady() {
-    resetLEDs();
+    refreshLEDState();
 
     Serial.println("Card failed, or not present!");
+    redLed->setState(BlinkingFast);
+    greenLed->setState(Off);
+    blueLed->setState(Off);
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-noreturn"
     while (true) {
-        beepAndBlinkRed(500);
-        delay(200);
+        refreshLEDState();
+        delay(50);
     }
 #pragma clang diagnostic pop
+}
+
+void refreshLEDState() {
+    unsigned int drawPhase = (millis() % 2000) / 500;
+
+    redLed->display(drawPhase);
+    greenLed->display(drawPhase);
+    blueLed->display(drawPhase);
 }
