@@ -11,7 +11,7 @@
 #define GT_PIN_LED_RED 8
 #define GT_PIN_LED_GREEN 7
 #define GT_PIN_LED_BLUE 6
-#define GT_PIN_BUZZER A3
+#define GT_PIN_BUZZER 9
 
 #define BUZZER_ENABLED true
 
@@ -41,6 +41,8 @@ TinyGPSHDOP last_hdop;
 TinyGPSAltitude last_alti;
 TinyGPSInteger last_sats;
 
+boolean hasSignal = false;
+
 static void beep(int length);
 
 static void smartDelay(unsigned long ms);
@@ -61,25 +63,33 @@ void initGpxFile();
 
 void preventOverflow();
 
-void initGPS() {
-    gpsSerial.begin(9600);
+void waitForNewData();
 
-    gpsSerial.print(F("$PUBX,41,1,0007,0003,4800,0*13\r\n"));
-    gpsSerial.flush();
-    delay(50);
-    if (gpsSerial.available() > 0) {
-        gpsSerial.begin(4800);
+void initGPS() {
+    char c = 0;
+
+    // repeat this until some "normal" character comes out... sometimes the init goes wrong and then the module just vomits
+    while (!isPrintable(c)) {
+        gpsSerial.begin(9600);
+
+        // switch to baud 4800 for more stability
+        gpsSerial.print(F("$PUBX,41,1,0007,0003,4800,0*13\r\n"));
         gpsSerial.flush();
         delay(50);
-    }
+        if (gpsSerial.available() > 0) {
+            gpsSerial.begin(4800);
+            gpsSerial.flush();
+            delay(50);
+        }
 
-    while (gpsSerial.available()) {
-        gpsSerial.read();
+        // clean buffer
+        while (gpsSerial.available()) {
+            c = (char) gpsSerial.read();
+        }
     }
 
     // TODO power saving mode?
 }
-
 
 void setup(void) {
     Serial.begin(9600);
@@ -130,6 +140,7 @@ void setup(void) {
     }
 
     Serial.println(F("Found valid location!"));
+    hasSignal = true;
 
     snapshotGPS();
 
@@ -141,49 +152,82 @@ void setup(void) {
     redLed->setState(Off);
     blueLed->setState(Off);
 
-    Serial.println("\n");
     refreshLEDState();
 }
 
 void loop(void) {
     refreshLEDState();
 
-    boolean loaded = false;
-
-    while (!loaded) {
-        while (gpsSerial.available()) {
-            gps.encode((char) gpsSerial.read());
-            loaded = true;
-        }
-    }
+    waitForNewData();
 
     boolean valid = gpsValid();
 
-    // TODO handle signal recovery
-
     if (valid) {
+        if (!hasSignal) Serial.println("\nRecovered location!\n");
+        hasSignal = true;
+
         snapshotGPS();
 
         greenLed->setState(BlinkingSlow);
         redLed->setState(Off);
         blueLed->setState(Off);
 
+        refreshLEDState();
+
         writeToGpx();
     } else {
-        Serial.println("\nLost location!\n");
+        if (hasSignal) Serial.println("\nLost location!\n");
+        hasSignal = false;
 
         blueLed->setState(BlinkingSlow);
         redLed->setState(Off);
         greenLed->setState(Off);
+
+        refreshLEDState();
+
+        gpsSerial.end();
+        initGPS();
     }
 
     smartDelay(GPX_INTERVAL - 1000);
 }
 
+void waitForNewData() {
+    boolean loaded = false;
+
+    unsigned long start = millis();
+
+    refreshLEDState();
+
+    // clean-up buffer
+    while (gpsSerial.available()) {
+        gpsSerial.read(); // throw-away
+    }
+
+    refreshLEDState();
+
+    int i = 0;
+
+    // until data are loaded
+    while (!loaded) {
+        if (i++ % 10 == 0) refreshLEDState();
+
+        // TODO try to load closed sentences
+        while (gpsSerial.available()) {
+            gps.encode((char) gpsSerial.read());
+
+            loaded = true;
+        }
+    }
+
+    Serial.println(millis() - start);
+}
+
 void checkIsReceivingData() {
-    Serial.print("Received chars: ");
+    Serial.print(F("Received chars: "));
     Serial.println(gps.charsProcessed());
 
+    // if there are no data received from the module in 5s, there's something wrong
     if (millis() > 5000 && gps.charsProcessed() < 10) {
         Serial.println(F("ERROR: not getting any GPS data!"));
         redLed->setState(BlinkingFast);
@@ -220,6 +264,8 @@ void initGpxFile() {
 
     preventOverflow();
 
+    // TODO handle timezone
+
     sprintf(filename,
             "%s/%02d-%02d-%02d%s",
             dir, last_time.hour(), last_time.minute(), last_time.second(), ".gpx"
@@ -236,6 +282,7 @@ void initGpxFile() {
         cardNotReady();
     }
 
+    // write GPX header:
     dataFile.print(F("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
                      "<gpx version=\"1.1\" creator=\"ArduinoGpsTracker\" xmlns=\"http://www.topografix.com/GPX/1/1\" \r\n"
                      "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\r\n"
@@ -246,7 +293,7 @@ void initGpxFile() {
             dir, last_time.hour(), last_time.minute(), last_time.second()
     );
     dataFile.print(trk);
-    dataFile.print(F("\r\n<trkseg>\r\n"));  // GPX header
+    dataFile.print(F("\r\n<trkseg>\r\n\r\n"));
 
     preventOverflow();
 
@@ -257,11 +304,13 @@ void initGpxFile() {
 }
 
 bool gpsValid() {
+    bool valid = gps.location.isValid() && gps.date.isValid() && gps.location.age() <= 2500;
+
     Serial.println(F("---"));
     Serial.print((double) millis() / 1000.0, 1);
     Serial.print(F(" valid: "));
-    Serial.print(gps.location.isValid() > 0 ? "true" : "false");
-    Serial.print(F(" "));
+    Serial.print(valid > 0 ? "true" : "false");
+    Serial.print(F(", "));
     Serial.print(gps.location.lat(), 6);
     Serial.print(F("/"));
     Serial.print(gps.location.lng(), 6);
@@ -273,6 +322,7 @@ bool gpsValid() {
     Serial.print(gps.location.age());
 
     preventOverflow();
+
     Serial.print(F(", date: "));
     Serial.print(gps.date.value());
     if (gps.satellites.isValid()) {
@@ -290,7 +340,7 @@ bool gpsValid() {
 
     preventOverflow();
 
-    return gps.location.isValid() && gps.date.isValid() && gps.date.age() <= 1500;
+    return valid;
 }
 
 void writeToGpx() {
@@ -323,6 +373,7 @@ void writeToGpx() {
     dataFile.seek(filesize);
 
     preventOverflow();
+
     dataFile.print(F("<trkpt lat=\""));
     dataFile.print(last_location.lat(), GPX_LOC_ACCURACY);
     dataFile.print(F("\" lon=\""));
@@ -330,6 +381,7 @@ void writeToGpx() {
     dataFile.print(F("\">"));
 
     preventOverflow();
+
     dataFile.print(F("<time>"));
     dataFile.print(formattedDate);
     dataFile.print(F("</time>"));
@@ -355,7 +407,7 @@ void writeToGpx() {
         dataFile.print(F("</hdop>"));
     }
 
-    dataFile.println(F("</trkpt>"));
+    dataFile.println(F("</trkpt>\n\r"));
     dataFile.print(GPX_FOOTER);
     dataFile.flush();
     dataFile.close();
@@ -371,7 +423,7 @@ static void beep(int length) {
 void cardNotReady() {
     refreshLEDState();
 
-    Serial.println("Card failed, or not present!");
+    Serial.println(F("Card failed, or not present!"));
     redLed->setState(BlinkingFast);
     greenLed->setState(Off);
     blueLed->setState(Off);
@@ -393,6 +445,8 @@ void refreshLEDState() {
 }
 
 static void smartDelay(unsigned long ms) {
+    // can't just wait but has to still read data from GPS module
+
     refreshLEDState();
     unsigned long end = millis() + ms;
     do {
@@ -407,6 +461,8 @@ unsigned long lastPrevention = 0;
 
 void preventOverflow() {
     refreshLEDState();
+
+    // throw away data to prevent overflow of buffer BUT don't do that too often
 
     if (millis() - lastPrevention > 200) {
         if (gpsSerial.available()) {
